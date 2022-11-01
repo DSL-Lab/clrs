@@ -22,6 +22,8 @@ import pickle
 from typing import Dict, List, Optional, Tuple, Union
 
 import chex
+from jax.experimental.host_callback import id_print
+from ml_collections import ConfigDict
 
 from clrs._src import decoders
 from clrs._src import losses
@@ -60,17 +62,22 @@ class BaselineModel(model.Model):
       spec: Union[_Spec, List[_Spec]],
       dummy_trajectory: Union[List[_Feedback], _Feedback],
       processor_factory: processors.ProcessorFactory,
+      exp_flags: ConfigDict,
       hidden_dim: int = 32,
       encode_hints: bool = False,
       decode_hints: bool = True,
       decode_diffs: bool = False,
       use_lstm: bool = False,
       learning_rate: float = 0.005,
+      scheduler: str = 'none',
+      training_steps: int = None,
       checkpoint_path: str = '/tmp/clrs3',
       freeze_processor: bool = False,
       dropout_prob: float = 0.0,
       hint_teacher_forcing_noise: float = 0.0,
       name: str = 'base_model',
+      net_params: dict = None,
+      clip_grad: bool = True,
   ):
     """Constructor for BaselineModel.
 
@@ -116,7 +123,18 @@ class BaselineModel(model.Model):
     self.checkpoint_path = checkpoint_path
     self.name = name
     self._freeze_processor = freeze_processor
-    self.opt = optax.adam(learning_rate)
+    scheduler_fn = _create_scheduler_fn(
+      scheduler_name=scheduler, training_steps=training_steps, learning_rate=learning_rate
+    )
+    if clip_grad:
+      self.opt = optax.chain(
+        optax.clip_by_global_norm(1),
+        optax.adam(scheduler_fn)
+      )
+    else:
+      self.opt = optax.adam(scheduler_fn)
+    self.net_params = net_params
+    self.exp_flags = exp_flags
 
     self.nb_dims = []
     if isinstance(dummy_trajectory, _Feedback):
@@ -133,18 +151,18 @@ class BaselineModel(model.Model):
       self.nb_dims.append(nb_dims)
 
     self._create_net_fns(hidden_dim, encode_hints, processor_factory, use_lstm,
-                         dropout_prob, hint_teacher_forcing_noise)
+                         dropout_prob, hint_teacher_forcing_noise, net_params)
     self.params = None
     self.opt_state = None
     self.opt_state_skeleton = None
 
   def _create_net_fns(self, hidden_dim, encode_hints, processor_factory,
-                      use_lstm, dropout_prob, hint_teacher_forcing_noise):
+                      use_lstm, dropout_prob, hint_teacher_forcing_noise, net_params):
     def _use_net(*args, **kwargs):
       return nets.Net(self._spec, hidden_dim, encode_hints,
                       self.decode_hints, self.decode_diffs,
                       processor_factory, use_lstm, dropout_prob,
-                      hint_teacher_forcing_noise, self.nb_dims)(*args, **kwargs)
+                      hint_teacher_forcing_noise, self.exp_flags, self.nb_dims,  **net_params)(*args, **kwargs)
 
     self.net_fn = hk.transform(_use_net)
     self.net_fn_apply = jax.jit(self.net_fn.apply,
@@ -179,16 +197,17 @@ class BaselineModel(model.Model):
       assert len(self._spec) == 1
       algorithm_index = 0
 
-    outs, hint_preds, diff_logits, gt_diff = self.net_fn_apply(
+    outs, hint_preds, diff_logits, gt_diff, hiddens, aux_net = self.net_fn_apply(
         self.params, rng_key, [features],
         repred=True, algorithm_index=algorithm_index)
+    aux_net['output_logits'] = outs
     return decoders.postprocess(self._spec[algorithm_index],
-                                outs), (hint_preds, diff_logits, gt_diff)
+                                outs), (hint_preds, diff_logits, gt_diff, hiddens), aux_net
 
   def _loss(self, params, rng_key, feedback, algorithm_index):
     """Calculates model loss f(feedback; params)."""
     (output_preds, hint_preds, diff_logits,
-     gt_diffs) = self.net_fn_apply(params, rng_key, [feedback.features],
+     gt_diffs, _, aux_net) = self.net_fn_apply(params, rng_key, [feedback.features],
                                    repred=False,
                                    algorithm_index=algorithm_index)
 
@@ -224,7 +243,12 @@ class BaselineModel(model.Model):
             decode_diffs=self.decode_diffs,
         )
 
+    for key in aux_net.keys():
+      if key.endswith('loss'):
+        # id_print(aux_net[key].mean(), what=f'The Loss {key}')
+        total_loss += aux_net[key].mean()  # Auxiliary loss
     return total_loss
+
 
   def update(
       self,
@@ -240,10 +264,10 @@ class BaselineModel(model.Model):
       assert len(self._spec) == 1
       algorithm_index = 0
 
+
     # Calculate and apply gradients.
     assert algorithm_index >= 0
-    lss, grads = jax.value_and_grad(self.jitted_loss)(params, rng_key, feedback,
-                                                      algorithm_index)
+    lss, grads = jax.value_and_grad(self.jitted_loss)(params, rng_key, feedback, algorithm_index)
     new_params, opt_state = self._update_params(params, grads, opt_state)
 
     return new_params, opt_state, lss
@@ -295,7 +319,7 @@ class BaselineModel(model.Model):
 
     return losses_
 
-  def restore_model(self, file_name: str, only_load_processor: bool = False):
+  def restore_model(self, file_name: str, only_load_processor: bool = False, replace_params: bool = False):
     """Restore model from `file_name`."""
     path = os.path.join(self.checkpoint_path, file_name)
     with open(path, 'rb') as f:
@@ -304,7 +328,10 @@ class BaselineModel(model.Model):
         restored_params = _filter_processor(restored_state['params'])
       else:
         restored_params = restored_state['params']
-      self.params = hk.data_structures.merge(self.params, restored_params)
+      if replace_params:
+        self.params = restored_params
+      else:
+        self.params = hk.data_structures.merge(self.params, restored_params)
       self.opt_state = restored_state['opt_state']
 
   def save_model(self, file_name: str):
@@ -329,8 +356,6 @@ class BaselineModelChunked(BaselineModel):
     `BaselineModel`.
   """
 
-  mp_states: List[nets.MessagePassingStateChunked]
-
   def _create_net_fns(self, hidden_dim, encode_hints, processor_factory,
                       use_lstm, dropout_prob, hint_teacher_forcing_noise):
     def _use_net(*args, **kwargs):
@@ -344,7 +369,6 @@ class BaselineModelChunked(BaselineModel):
     self.net_fn_apply = jax.jit(
         functools.partial(self.net_fn.apply, init_mp_state=False),
         static_argnames=['repred', 'algorithm_index'])
-    self.jitted_loss = jax.jit(self._loss, static_argnames=['algorithm_index'])
 
   def _init_mp_state(self, features_list: List[_FeaturesChunked],
                      rng_key: _Array):
@@ -361,9 +385,8 @@ class BaselineModelChunked(BaselineModel):
         init_mp_state=True, algorithm_index=-1)
     return mp_states
 
-  def init(  # pytype: disable=signature-mismatch  # overriding-parameter-type-checks
-      self, features: Union[_FeaturesChunked, List[_FeaturesChunked]],
-      seed: _Seed):
+  def init(self, features: Union[_FeaturesChunked, List[_FeaturesChunked]],
+           seed: _Seed):
     if not isinstance(features, list):
       assert len(self._spec) == 1
       features = [features]
@@ -377,58 +400,10 @@ class BaselineModelChunked(BaselineModel):
     # want to avoid updating the state of params of untrained algorithms.
     self.opt_state_skeleton = self.opt.init(jnp.zeros(1))
 
-  def predict(  # pytype: disable=signature-mismatch  # overriding-parameter-type-checks
-      self,
-      rng_key: hk.PRNGSequence,
-      features: _FeaturesChunked,
-      algorithm_index: Optional[int] = None):
+  def predict(self, rng_key: hk.PRNGSequence, features: _FeaturesChunked,
+              algorithm_index: Optional[int] = None):
     """Inference not implemented. Chunked model intended for training only."""
     raise NotImplementedError
-
-  def _loss(self, params, rng_key, feedback, algorithm_index):
-    ((output_preds, hint_preds, diff_logits, gt_diffs),
-     mp_state) = self.net_fn_apply(params, rng_key, [feedback.features],
-                                   [self.mp_states[algorithm_index]],
-                                   repred=False,
-                                   algorithm_index=algorithm_index)
-
-    nb_nodes = _nb_nodes(feedback, is_chunked=True)
-
-    total_loss = 0.0
-    is_first = feedback.features.is_first
-    is_last = feedback.features.is_last
-
-    # Calculate output loss.
-    for truth in feedback.outputs:
-      total_loss += losses.output_loss_chunked(
-          truth=truth,
-          pred=output_preds[truth.name],
-          is_last=is_last,
-          nb_nodes=nb_nodes,
-      )
-
-    # Optionally accumulate diff losses.
-    if self.decode_diffs:
-      total_loss += losses.diff_loss_chunked(
-          diff_logits=diff_logits,
-          gt_diffs=gt_diffs,
-          is_first=is_first,
-      )
-
-    # Optionally accumulate hint losses.
-    if self.decode_hints:
-      for truth in feedback.features.hints:
-        loss = losses.hint_loss_chunked(
-            truth=truth,
-            pred=hint_preds[truth.name],
-            gt_diffs=gt_diffs,
-            is_first=is_first,
-            nb_nodes=nb_nodes,
-            decode_diffs=self.decode_diffs,
-        )
-        total_loss += loss
-
-    return total_loss, (mp_state,)
 
   def update(
       self,
@@ -443,10 +418,53 @@ class BaselineModelChunked(BaselineModel):
     if algorithm_index is None:
       assert len(self._spec) == 1
       algorithm_index = 0
+    def loss(params, rng_key, feedback):
+      ((output_preds, hint_preds, diff_logits, gt_diffs),
+       mp_state) = self.net_fn_apply(params, rng_key, [feedback.features],
+                                     [self.mp_states[algorithm_index]],
+                                     repred=False,
+                                     algorithm_index=algorithm_index)
+
+      nb_nodes = _nb_nodes(feedback, is_chunked=True)
+
+      total_loss = 0.0
+      is_first = feedback.features.is_first
+      is_last = feedback.features.is_last
+
+      # Calculate output loss.
+      for truth in feedback.outputs:
+        total_loss += losses.output_loss_chunked(
+            truth=truth,
+            pred=output_preds[truth.name],
+            is_last=is_last,
+            nb_nodes=nb_nodes,
+        )
+
+      # Optionally accumulate diff losses.
+      if self.decode_diffs:
+        total_loss += losses.diff_loss_chunked(
+            diff_logits=diff_logits,
+            gt_diffs=gt_diffs,
+            is_first=is_first,
+        )
+
+      # Optionally accumulate hint losses.
+      if self.decode_hints:
+        for truth in feedback.features.hints:
+          loss = losses.hint_loss_chunked(
+              truth=truth,
+              pred=hint_preds[truth.name],
+              gt_diffs=gt_diffs,
+              is_first=is_first,
+              nb_nodes=nb_nodes,
+              decode_diffs=self.decode_diffs,
+          )
+          total_loss += loss
+
+      return total_loss, (mp_state,)
 
     (lss, (self.mp_states[algorithm_index],)), grads = jax.value_and_grad(
-        self.jitted_loss, has_aux=True)(params, rng_key, feedback,
-                                        algorithm_index)
+        loss, has_aux=True)(params, rng_key, feedback)
     new_params, opt_state = self._update_params(params, grads, opt_state)
 
     return new_params, opt_state, lss
@@ -530,3 +548,13 @@ def filter_null_grads(grads, opt, opt_state, opt_state_skeleton):
       opt_state_skeleton, flat_opt_state, opt_state)
   updates = unflatten(flat_updates, jax.tree_map(lambda x: 0., grads))
   return updates, new_opt_state
+
+
+def _create_scheduler_fn(scheduler_name, training_steps, learning_rate):
+  if scheduler_name == 'none':
+    return optax.constant_schedule(learning_rate)
+  elif scheduler_name == 'cosine':
+    return optax.cosine_decay_schedule(init_value=learning_rate, decay_steps=training_steps)
+  else:
+    raise NotImplementedError
+

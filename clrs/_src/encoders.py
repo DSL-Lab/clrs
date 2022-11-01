@@ -28,7 +28,7 @@ _Spec = specs.Spec
 _Type = specs.Type
 
 
-def construct_encoders(loc: str, t: str, hidden_dim: int, name: str):
+def construct_encoders(loc: str, t: str, hidden_dim: int, name: str, algorithm: str):
   """Constructs encoders."""
   linear = functools.partial(hk.Linear, name=f'{name}_enc_linear')
   encoders = [linear(hidden_dim)]
@@ -51,6 +51,9 @@ def preprocess(dp: _DataPoint, nb_nodes: int) -> _Array:
 
 def accum_adj_mat(dp: _DataPoint, data: _Array, adj_mat: _Array) -> _Array:
   """Accumulates adjacency matrix."""
+  if dp.name == 'pos': # ignore edge position for accumulating adjacency matrix
+    return (adj_mat > 0.).astype('float32')
+
   if dp.location == _Location.NODE and dp.type_ == _Type.POINTER:
     adj_mat += ((data + jnp.transpose(data, (0, 2, 1))) > 0.0)
   elif dp.location == _Location.EDGE and dp.type_ == _Type.MASK:

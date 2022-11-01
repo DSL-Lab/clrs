@@ -17,3 +17,5 @@ venv/
 # Editors
 .idea
 .vscode
+
+wandb/

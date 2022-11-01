@@ -20,11 +20,13 @@ import functools
 from typing import Any, Dict, List, Optional, Tuple
 
 import chex
+from jax.experimental.host_callback import id_print
+from ml_collections import ConfigDict
 
 from clrs._src import decoders
 from clrs._src import encoders
+from clrs._src import processors as processors
 from clrs._src import probing
-from clrs._src import processors
 from clrs._src import samplers
 from clrs._src import specs
 
@@ -51,7 +53,9 @@ class _MessagePassingScanState:
   gt_diffs: chex.Array
   output_preds: chex.Array
   hiddens: chex.Array
+  edge_hiddens: chex.Array
   lstm_state: Optional[hk.LSTMState]
+  aux: chex.Array
 
 
 @chex.dataclass
@@ -86,8 +90,12 @@ class Net(hk.Module):
       use_lstm: bool,
       dropout_prob: float,
       hint_teacher_forcing_noise: float,
+      exp_flags: ConfigDict,
       nb_dims=None,
       name: str = 'net',
+      max_recurrent_steps: int = 0,  # If zero, pay attention to hints
+      algorithm: str = None,
+      discretizer: str = 'none',
   ):
     """Constructs a `Net`."""
     super().__init__(name=name)
@@ -102,6 +110,10 @@ class Net(hk.Module):
     self.processor_factory = processor_factory
     self.nb_dims = nb_dims
     self.use_lstm = use_lstm
+    self.max_recurrent_steps = max_recurrent_steps
+    self.algorithm = algorithm
+    self.discretizer = discretizer
+    self.exp_flags = exp_flags
 
   def _msg_passing_step(self,
                         mp_state: _MessagePassingScanState,
@@ -148,7 +160,7 @@ class Net(hk.Module):
                 name=hint.name, location=loc, type_=typ, data=hint_data))
 
     gt_diffs = None
-    if hints[0].data.shape[0] > 1 and self.decode_diffs:
+    if self.decode_diffs and hints[0].data.shape[0] > 1:
       gt_diffs = {
           _Location.NODE: jnp.zeros((batch_size, nb_nodes)),
           _Location.EDGE: jnp.zeros((batch_size, nb_nodes, nb_nodes)),
@@ -165,11 +177,11 @@ class Net(hk.Module):
       for loc in [_Location.NODE, _Location.EDGE, _Location.GRAPH]:
         gt_diffs[loc] = (gt_diffs[loc] > 0.0).astype(jnp.float32) * 1.0
 
-    (hiddens, output_preds_cand, hint_preds, diff_logits,
-     lstm_state) = self._one_step_pred(inputs, cur_hint, mp_state.hiddens,
+    (hiddens, edge_hiddens, output_preds_cand, hint_preds, diff_logits,
+     lstm_state, aux) = self._one_step_pred(inputs, cur_hint, mp_state.hiddens, mp_state.edge_hiddens,
                                        batch_size, nb_nodes,
                                        mp_state.lstm_state,
-                                       spec, encs, decs, diff_decs)
+                                       spec, encs, decs, diff_decs, repred)
 
     if first_step:
       output_preds = output_preds_cand
@@ -203,7 +215,8 @@ class Net(hk.Module):
 
     new_mp_state = _MessagePassingScanState(
         hint_preds=hint_preds, diff_logits=diff_logits, gt_diffs=gt_diffs,
-        output_preds=output_preds, hiddens=hiddens, lstm_state=lstm_state)
+        output_preds=output_preds, hiddens=hiddens, edge_hiddens=edge_hiddens,
+      lstm_state=lstm_state, aux=aux)
 
     # Complying to jax.scan, the first returned value is the state we carry over
     # the second value is the output that will be stacked over steps.
@@ -245,6 +258,13 @@ class Net(hk.Module):
      self.diff_decoders) = self._construct_encoders_decoders()
     self.processor = self.processor_factory(self.hidden_dim)
 
+    if self.discretizer == 'vq':
+      self.hidden_vq_layer = hk.nets.VectorQuantizer(
+        embedding_dim=8,
+        num_embeddings=128,
+        commitment_cost=0.0,
+        name='hidden_vq'
+      )
     # Optionally construct LSTM.
     if self.use_lstm:
       self.lstm = hk.LSTM(
@@ -262,9 +282,9 @@ class Net(hk.Module):
 
       batch_size, nb_nodes = _data_dimensions(features)
 
-      nb_mp_steps = max(1, hints[0].data.shape[0] - 1)
+      nb_mp_steps = self.max_recurrent_steps or max(1, hints[0].data.shape[0] - 1)
       hiddens = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))
-
+      edge_hiddens = jnp.zeros((batch_size, nb_nodes, nb_nodes, self.hidden_dim))
       if self.use_lstm:
         lstm_state = lstm_init(batch_size * nb_nodes)
         lstm_state = jax.tree_map(
@@ -275,7 +295,7 @@ class Net(hk.Module):
 
       mp_state = _MessagePassingScanState(
           hint_preds=None, diff_logits=None, gt_diffs=None,
-          output_preds=None, hiddens=hiddens, lstm_state=lstm_state)
+          output_preds=None, hiddens=hiddens, edge_hiddens=edge_hiddens, lstm_state=lstm_state, aux=None)
 
       # Do the first step outside of the scan because it has a different
       # computation graph.
@@ -327,14 +347,16 @@ class Net(hk.Module):
     hint_preds = invert(output_mp_state.hint_preds)
     diff_logits = invert(output_mp_state.diff_logits)
     gt_diffs = invert(output_mp_state.gt_diffs)
-
-    return output_preds[-1], hint_preds, diff_logits, gt_diffs
+    hiddens = output_mp_state.hiddens
+    aux = output_mp_state.aux
+    return output_preds[-1], hint_preds, diff_logits, gt_diffs, hiddens, aux
 
   def _construct_encoders_decoders(self):
     """Constructs encoders and decoders, separate for each algorithm."""
     encoders_ = []
     decoders_ = []
     diff_decoders = []
+    assert len(self.spec) == 1, "Only one algorithm is supported"
     for (algo_idx, spec) in enumerate(self.spec):
       enc = {}
       dec = {}
@@ -344,7 +366,7 @@ class Net(hk.Module):
           # Build input encoders.
           enc[name] = encoders.construct_encoders(
               loc, t, hidden_dim=self.hidden_dim,
-              name=f'algo_{algo_idx}_{name}')
+              name=f'{name}', algorithm=self.algorithm)
 
         if stage == _Stage.OUTPUT or (
             stage == _Stage.HINT and self.decode_hints):
@@ -370,6 +392,7 @@ class Net(hk.Module):
       inputs: _Trajectory,
       hints: _Trajectory,
       hidden: _Array,
+      edge_hidden: _Array,
       batch_size: int,
       nb_nodes: int,
       lstm_state: Optional[hk.LSTMState],
@@ -377,9 +400,9 @@ class Net(hk.Module):
       encs: Dict[str, List[hk.Module]],
       decs: Dict[str, Tuple[hk.Module]],
       diff_decs: Dict[str, Any],
+      repred: bool
   ):
     """Generates one-step predictions."""
-
     # Initialise empty node/edge/graph features and adjacency matrix.
     node_fts = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))
     edge_fts = jnp.zeros((batch_size, nb_nodes, nb_nodes, self.hidden_dim))
@@ -406,7 +429,12 @@ class Net(hk.Module):
           raise Exception(f'Failed to process {dp}') from e
 
     # PROCESS ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    nxt_hidden = self.processor(
+
+    if self.exp_flags.markovian_processing: # Do not carry over a hidden state, just rely on hint and inputs
+      hidden = jnp.zeros_like(hidden)
+      edge_hidden = jnp.zeros_like(edge_hidden)
+
+    nxt_hidden, nxt_edge_hidden, aux_processor = self.processor(
         node_fts,
         edge_fts,
         graph_fts,
@@ -414,9 +442,26 @@ class Net(hk.Module):
         hidden,
         batch_size=batch_size,
         nb_nodes=nb_nodes,
+        edge_hidden=edge_hidden,
+        is_training=not repred
     )
     nxt_hidden = hk.dropout(hk.next_rng_key(), self._dropout_prob, nxt_hidden)
-
+    aux = {}
+    aux.update(aux_processor)
+    if self.discretizer == 'binary':
+      nxt_hidden = straight_through_sigmoid(hk.next_rng_key(), nxt_hidden, is_training=not repred)
+      nxt_edge_hidden = straight_through_sigmoid(hk.next_rng_key(), nxt_edge_hidden, is_training=not repred)
+    elif self.discretizer == 'none':
+      pass
+    elif self.discretizer == 'vq':
+      vq_result = vq_quantize(self.hidden_vq_layer, nxt_hidden, is_training=not repred)
+      nxt_hidden = vq_result["quantize"]
+      aux.update(vq_result)
+    elif self.discretizer == 'gumbel':
+      nxt_hidden = gumbel_softmax(hk.next_rng_key(), nxt_hidden, is_training=not repred)
+      nxt_edge_hidden = gumbel_softmax(hk.next_rng_key(), nxt_edge_hidden, is_training=not repred)
+    else:
+      raise Exception("Discretizer not found.")
     if self.use_lstm:
       # lstm doesn't accept multiple batch dimensions (in our case, batch and
       # nodes), so we vmap over the (first) batch dimension.
@@ -425,7 +470,7 @@ class Net(hk.Module):
       nxt_lstm_state = None
 
     h_t = jnp.concatenate([node_fts, hidden, nxt_hidden], axis=-1)
-
+    h_t_edge = jnp.concatenate([edge_fts, edge_hidden, nxt_edge_hidden], axis=-1)
     # DECODE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Decode features and (optionally) hints.
     hint_preds, output_preds = decoders.decode_fts(
@@ -433,11 +478,16 @@ class Net(hk.Module):
         spec=spec,
         h_t=h_t,
         adj_mat=adj_mat,
-        edge_fts=edge_fts,
+        edge_fts=h_t_edge,
         graph_fts=graph_fts,
         inf_bias=self.processor.inf_bias,
         inf_bias_edge=self.processor.inf_bias_edge,
     )
+
+    if self.exp_flags.add_hint_mask: # Keep the previous hiddens if the mask says so!
+      mask_bool = (jnp.expand_dims(hint_preds['hnt_mask'], -1) > 0)
+      nxt_hidden = mask_bool * nxt_hidden + (1 - mask_bool) * hidden
+      # TODO: Same for edges
 
     # Optionally decode diffs.
     diff_preds = decoders.maybe_decode_diffs(
@@ -449,8 +499,7 @@ class Net(hk.Module):
         nb_nodes=nb_nodes,
         decode_diffs=self.decode_diffs,
     )
-
-    return nxt_hidden, output_preds, hint_preds, diff_preds, nxt_lstm_state
+    return nxt_hidden, nxt_edge_hidden, output_preds, hint_preds, diff_preds, nxt_lstm_state, aux
 
 
 class NetChunked(Net):
@@ -757,3 +806,54 @@ def _is_not_done_broadcast(lengths, i, tensor):
   while len(is_not_done.shape) < len(tensor.shape):
     is_not_done = jnp.expand_dims(is_not_done, -1)
   return is_not_done
+
+
+def straight_through_sigmoid(rng_key, x: _Array, is_training: bool):
+  # hidden_ones = jnp.zeros_like(x).at[..., :128].set(1)  # Only two bits of hidden
+
+  x_probs = jax.nn.sigmoid(x)
+  x_probs_detached = jax.lax.stop_gradient(x_probs)
+  if is_training:  # Take samples
+    z = jax.random.bernoulli(rng_key, x_probs_detached).astype(x_probs_detached.dtype)
+  else:  # Take max
+    z = jnp.where(x_probs_detached > 0.5, jnp.full_like(x_probs_detached, 1), jnp.full_like(x_probs_detached, 0))
+
+  return z + x_probs - x_probs_detached
+
+
+def vq_quantize(vq_layer: hk.nets.VectorQuantizer, x: _Array, is_training: bool):
+  b, n, d = x.shape
+  embed_dim = vq_layer.embedding_dim
+  x_reshaped = x.reshape(b, n, d//embed_dim, embed_dim)
+  vq_result = vq_layer(x_reshaped, is_training)
+  return {
+    "quantize": vq_result["quantize"].reshape(b, n, d),
+    "loss": vq_result["loss"],
+    "encodings": vq_result["encodings"],
+    "encoding_indices": vq_result["encoding_indices"],
+  }
+
+
+def reinforce_sigmoid(rng_key, x: _Array, is_training: bool):
+  raise Exception("!!!!")
+
+
+def gumbel_softmax(rng_key, x: _Array, is_training: bool):
+  b, n, d = x.shape
+  embed_dim = 8
+  x_reshaped = x.reshape(b, n, d//embed_dim, embed_dim)
+  x_gumbel_reshaped = _sample_gumbel(rng_key, x_reshaped, hard=False)
+  x_gumbel = x_gumbel_reshaped.reshape(b, n, d)
+  return x_gumbel
+
+
+def _sample_gumbel(rng_key, logits: _Array, hard: bool, tau: float = 0.1):
+  gumbels = jax.random.gumbel(key=rng_key, shape=logits.shape, dtype=logits.dtype)
+  gumbels = (logits + gumbels) / tau
+  y_soft = jax.nn.softmax(gumbels)
+
+  if hard:
+    one_hot = jax.nn.one_hot(jnp.argmax(y_soft, axis=-1), num_classes=y_soft.shape[-1])
+    return one_hot + y_soft - jax.lax.stop_gradient(y_soft)
+  else:
+    return y_soft

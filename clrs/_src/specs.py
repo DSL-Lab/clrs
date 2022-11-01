@@ -29,7 +29,7 @@ algorithmic states (`hint`).
 At minimum, each node contains a `pos` probe that serves as a unique index e.g.
 for representing sequential data where appropriate
 """
-
+import copy
 import types
 from typing import Dict, Tuple
 
@@ -518,3 +518,6 @@ SPECS = types.MappingProxyType({
         'phase': (Stage.HINT, Location.GRAPH, Type.CATEGORICAL)
     }
 })
+
+ORIGINAL_SPECS = types.MappingProxyType({k: copy.deepcopy(val) for k, val in SPECS.items()}) # Keeps things unchanged
+

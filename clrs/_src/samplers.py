@@ -17,16 +17,19 @@
 
 import abc
 import collections
+from itertools import starmap
+from multiprocessing.sharedctypes import Value
+import os
 import types
+import networkx as nx
 
 from typing import Any, Callable, List, Optional, Tuple
 
 from clrs._src import algorithms
 from clrs._src import probing
 from clrs._src import specs
-import jax
 import numpy as np
-
+from tqdm import tqdm
 
 _Array = np.ndarray
 _DataPoint = probing.DataPoint
@@ -42,22 +45,31 @@ Feedback = collections.namedtuple('Feedback', ['features', 'outputs'])
 
 # CLRS-30 baseline spec.
 CLRS30 = types.MappingProxyType({
+    'strategy': os.environ.get('CLRS_SAMPLING_STRATEGY', 'standard'),
+    'disable_hints': os.environ.get('CLRS_DISABLE_HINTS', 'false').lower() == 'true',
     'train': {
-        'num_samples': 1000,
-        'length': 16,
+        'num_samples': int(os.environ.get('CLRS_TRAIN_SAMPLES', 1000)),
+        'length': int(os.environ.get('CLRS_TRAIN_LENGTH', 16)),
         'seed': 1,
     },
     'val': {
-        'num_samples': 32,
-        'length': 16,
+        'num_samples': int(os.environ.get('CLRS_VAL_SAMPLES', 32)),
+        'length': int(os.environ.get('CLRS_VAL_LENGTH', 16)),
         'seed': 2,
     },
     'test': {
-        'num_samples': 32,
-        'length': 64,
+        'num_samples': int(os.environ.get('CLRS_TEST_SAMPLES', 32)),
+        'length': int(os.environ.get('CLRS_TEST_LENGTH', 64)),
         'seed': 3,
     },
 })
+
+
+class SamplingStrategy:
+  STANDARD = 'standard'
+  REG = 'reg'
+  REG_SAME_NODES = 'reg_same_nodes'
+  REG_SAME_DEGREE = 'reg_same_degree'
 
 
 class Sampler(abc.ABC):
@@ -70,6 +82,8 @@ class Sampler(abc.ABC):
       num_samples: int,
       *args,
       seed: Optional[int] = None,
+      clrs_config: Optional[types.MappingProxyType] = CLRS30,
+      split: Optional[str] = None,
       **kwargs,
   ):
     """Initializes a `Sampler`.
@@ -86,23 +100,32 @@ class Sampler(abc.ABC):
     # Use `RandomState` to ensure deterministic sampling across Numpy versions.
     self._rng = np.random.RandomState(seed)
     self._num_samples = num_samples
+    self._clrs_config = clrs_config
+    self._split = split
 
     inputs = []
     outputs = []
     hints = []
+    lengths = []
 
-    for _ in range(num_samples):
+    for _ in tqdm(range(num_samples)):
       data = self._sample_data(*args, **kwargs)
       _, probes = algorithm(*data)
       inp, outp, hint = probing.split_stages(probes, spec)
       inputs.append(inp)
       outputs.append(outp)
-      hints.append(hint)
-
+      if not self._clrs_config['disable_hints']:
+        hints.append(hint)
+      else:
+        lengths.append(hint[0].data.shape[0])
     # Batch and pad trajectories to max(T).
     self._inputs = _batch_io(inputs)
     self._outputs = _batch_io(outputs)
-    self._hints, self._lengths = _batch_hints(hints)
+    if not self._clrs_config['disable_hints']:
+      self._hints, self._lengths = _batch_hints(hints)
+    else:
+      self._hints = None
+      self._lengths = np.array(lengths)
 
   def next(self, batch_size: Optional[int] = None) -> Feedback:
     """Subsamples trajectories from the pre-generated dataset.
@@ -122,7 +145,10 @@ class Sampler(abc.ABC):
       indices = self._rng.choice(self._num_samples, (batch_size,), replace=True)
       inputs = _subsample_data(self._inputs, indices, axis=0)
       outputs = _subsample_data(self._outputs, indices, axis=0)
-      hints = _subsample_data(self._hints, indices, axis=1)
+      if not self._clrs_config['disable_hints']:
+        hints = _subsample_data(self._hints, indices, axis=1)
+      else:
+        hints = None
       lengths = self._lengths[indices]
 
     else:
@@ -149,7 +175,6 @@ class Sampler(abc.ABC):
   def _random_er_graph(self, nb_nodes, p=0.5, directed=False, acyclic=False,
                        weighted=False, low=0.0, high=1.0):
     """Random Erdos-Renyi graph."""
-
     mat = self._rng.binomial(1, p, size=(nb_nodes, nb_nodes))
     if not directed:
       mat *= np.transpose(mat)
@@ -157,6 +182,39 @@ class Sampler(abc.ABC):
       mat = np.triu(mat, k=1)
       p = self._rng.permutation(nb_nodes)  # To allow nontrivial solutions
       mat = mat[p, :][:, p]
+
+    if weighted:
+      weights = self._rng.uniform(low=low, high=high, size=(nb_nodes, nb_nodes))
+      if not directed:
+        weights *= np.transpose(weights)
+        weights = np.sqrt(weights + 1e-3)  # Add epsilon to protect underflow
+      mat = mat.astype(float) * weights
+    return mat
+
+  def _random_er_or_k_reg_graph(self, nb_nodes, p=0.5, k_16_nodes=4, directed=False, acyclic=False,
+                       weighted=False, low=0.0, high=1.0, ):
+    if self._clrs_config['strategy'] == 'standard':  # Standard ER Sampling of CLRS
+      return self._random_er_graph(
+        nb_nodes, p=p, directed=directed, acyclic=acyclic, weighted=weighted, low=low, high=high
+      )
+    elif self._clrs_config['strategy'] in ['reg', 'reg_same_deg', 'reg_same_nodes']:  # K-Regular Sampling
+      assert self._split in ['train', 'test', 'val'], f"{self._split} not valid!"
+      d = _get_d_regular_param(
+        nb_nodes=nb_nodes,
+        clrs_config=self._clrs_config, split=self._split, directed=directed, k_16_nodes=k_16_nodes
+      )
+      if d == 0:
+        return np.zeros((nb_nodes, nb_nodes))
+      mat = nx.to_numpy_array(nx.random_regular_graph(d, nb_nodes, seed=self._rng))
+      if directed:
+        mat = _orient_edges(mat, self._rng)
+      if acyclic:  # TODO: Can we Control the degree?
+        mat = np.triu(mat, k=1)
+      p = self._rng.permutation(nb_nodes)  # To allow nontrivial solutions
+      mat = mat[p, :][:, p]
+    else:
+      raise ValueError("Not found")
+
     if weighted:
       weights = self._rng.uniform(low=low, high=high, size=(nb_nodes, nb_nodes))
       if not directed:
@@ -343,8 +401,8 @@ class DfsSampler(Sampler):
       length: int,
       p: float = 0.5,
   ):
-    graph = self._random_er_graph(
-        nb_nodes=length, p=p, directed=True, acyclic=False, weighted=False)
+    graph = self._random_er_or_k_reg_graph(
+        nb_nodes=length, p=p, k_16_nodes=4, directed=True, acyclic=False, weighted=False)
     return [graph]
 
 
@@ -356,8 +414,10 @@ class BfsSampler(Sampler):
       length: int,
       p: float = 0.5,
   ):
-    graph = self._random_er_graph(
-        nb_nodes=length, p=p, directed=False, acyclic=False, weighted=False)
+    # p = np.sqrt(p * p * 16 / length)
+    # print("p = ", p)
+    graph = self._random_er_or_k_reg_graph(
+        nb_nodes=length, p=p, k_16_nodes=4, directed=False, acyclic=False, weighted=False)
     source_node = self._rng.choice(length)
     return [graph, source_node]
 
@@ -370,8 +430,8 @@ class TopoSampler(Sampler):
       length: int,
       p: float = 0.5,
   ):
-    graph = self._random_er_graph(
-        nb_nodes=length, p=p, directed=True, acyclic=True, weighted=False)
+    graph = self._random_er_or_k_reg_graph(
+        nb_nodes=length, p=p, k_16_nodes=4, directed=True, acyclic=True, weighted=False)
     return [graph]
 
 
@@ -383,8 +443,9 @@ class ArticulationSampler(Sampler):
       length: int,
       p: float = 0.2,
   ):
-    graph = self._random_er_graph(
-        nb_nodes=length, p=p, directed=False, acyclic=False, weighted=False)
+    graph = self._random_er_or_k_reg_graph(# TODO: How to choose? Not so sparse, not so dense?
+        nb_nodes=length, p=p, k_16_nodes=3, directed=False, acyclic=False, weighted=False
+    )
     return [graph]
 
 
@@ -398,9 +459,10 @@ class MSTSampler(Sampler):
       low: float = 0.,
       high: float = 1.,
   ):
-    graph = self._random_er_graph(
+    graph = self._random_er_or_k_reg_graph(
         nb_nodes=length,
         p=p,
+        k_16_nodes=4,
         directed=False,
         acyclic=False,
         weighted=True,
@@ -419,9 +481,10 @@ class BellmanFordSampler(Sampler):
       low: float = 0.,
       high: float = 1.,
   ):
-    graph = self._random_er_graph(
+    graph = self._random_er_or_k_reg_graph(
         nb_nodes=length,
         p=p,
+        k_16_nodes=4,
         directed=False,
         acyclic=False,
         weighted=True,
@@ -441,9 +504,10 @@ class DAGPathSampler(Sampler):
       low: float = 0.,
       high: float = 1.,
   ):
-    graph = self._random_er_graph(
+    graph = self._random_er_or_k_reg_graph(
         nb_nodes=length,
         p=p,
+        k_16_nodes=4,
         directed=True,
         acyclic=True,
         weighted=True,
@@ -463,9 +527,10 @@ class FloydWarshallSampler(Sampler):
       low: float = 0.,
       high: float = 1.,
   ):
-    graph = self._random_er_graph(
+    graph = self._random_er_or_k_reg_graph(
         nb_nodes=length,
         p=p,
+        k_16_nodes=4,
         directed=False,
         acyclic=False,
         weighted=True,
@@ -484,9 +549,12 @@ class SccSampler(Sampler):
       p: float = 0.5,
       eps: float = 0.01,
   ):
+    if self._clrs_config['strategy'] in [SamplingStrategy.REG, SamplingStrategy.REG_SAME_DEGREE, SamplingStrategy.REG_SAME_NODES]:
+      k = _get_num_communities(nb_nodes=length, clrs_config=self._clrs_config, split=self._split, k_16_nodes=k)
+
     graph = self._random_community_graph(
-        nb_nodes=length, k=k, p=p, eps=eps,
-        directed=True, acyclic=False, weighted=False)
+      nb_nodes=length, k=k, p=p, eps=eps, directed=True, acyclic=False, weighted=False
+    )
     return [graph]
 
 
@@ -620,11 +688,29 @@ def _batch_io(traj_io: Trajectories) -> Trajectory:
 
   assert traj_io  # non-empty
   for sample_io in traj_io:
-    for i, dp in enumerate(sample_io):
+    for dp in sample_io:
       assert dp.data.shape[0] == 1  # batching axis
-      assert traj_io[0][i].name == dp.name
 
-  return jax.tree_util.tree_map(lambda *x: np.concatenate(x), *traj_io)
+  batched_traj = traj_io[0]  # construct batched trajectory in-place
+  batched_data = [[] for _ in range(len(batched_traj))]
+  for cur_sample in traj_io:
+    for i in range(len(batched_traj)):
+      # Validate that each trajectory contains the same probes.
+      assert batched_traj[i].name == cur_sample[i].name
+
+      batched_data[i].append(cur_sample[i].data)
+
+  for i in range(len(batched_traj)):
+    # Concatenate each probe along the trajectory/time axis.
+    batched_traj[i] = probing.DataPoint(
+        name=batched_traj[i].name,
+        location=batched_traj[i].location,
+        type_=batched_traj[i].type_,
+        data=np.concatenate(batched_data[i],
+                            axis=0)
+    )
+
+  return batched_traj
 
 
 def _batch_hints(traj_hints: Trajectories) -> Tuple[Trajectory, List[int]]:
@@ -649,23 +735,52 @@ def _batch_hints(traj_hints: Trajectories) -> Tuple[Trajectory, List[int]]:
       if dp.data.shape[0] > max_steps:
         max_steps = dp.data.shape[0]
 
-  # Create zero-filled space for the batched hints, then copy each hint
-  # up to the corresponding length.
-  batched_traj = jax.tree_util.tree_map(
-      lambda x: np.zeros((max_steps, len(traj_hints)) + x.shape[2:]),
-      traj_hints[0])
+  batched_traj = [[] for _ in range(len(traj_hints[0]))]  # construct batched trajectory in-place
   hint_lengths = np.zeros(len(traj_hints))
+  # for i in range(len(traj_hints[0])):
+  #   hint_i = traj_hints[0][i]
+  #   assert batched_traj[i].name == hint_i.name
+  #   batched_traj[i] = probing.DataPoint(
+  #       name=batched_traj[i].name,
+  #       location=batched_traj[i].location,
+  #       type_=batched_traj[i].type_,
+  #       data=np.zeros((max_steps,) + hint_i.data.shape[1:]))
+  #   batched_traj[i].data[:hint_i.data.shape[0]] = hint_i.data
+  #   if i > 0:
+  #     assert hint_lengths[0] == hint_i.data.shape[0]
+  #   else:
+  #     hint_lengths[0] = hint_i.data.shape[0]
 
-  for sample_idx, cur_sample in enumerate(traj_hints):
-    for i in range(len(cur_sample)):
-      assert batched_traj[i].name == cur_sample[i].name
-      cur_data = cur_sample[i].data
-      cur_length = cur_data.shape[0]
-      batched_traj[i].data[:cur_length, sample_idx:sample_idx+1] = cur_data
+  for i in range(len(traj_hints[0])):
+    batched_traj[i] = probing.DataPoint(
+      name=traj_hints[0][i].name,
+      location=traj_hints[0][i].location,
+      type_=traj_hints[0][i].type_,
+      data=np.zeros((max_steps, len(traj_hints)) + traj_hints[0][i].data.shape[2:])
+    )
+
+  for hint_ind, cur_hint in enumerate(traj_hints):
+    for i in range(len(cur_hint)):
+      assert batched_traj[i].name == cur_hint[i].name
+
+      # # Extend the previously built stacked hint with new all-zero data point.
+      # batched_traj[i] = probing.DataPoint(
+      #     name=batched_traj[i].name,
+      #     location=batched_traj[i].location,
+      #     type_=batched_traj[i].type_,
+      #     data=np.concatenate(
+      #         [batched_traj[i].data,
+      #          np.zeros((max_steps,) + cur_hint[i].data.shape[1:])], axis=1))
+
+      # Once extended, populate it only up to the current hint's length.
+      # The -1: indexes the last timestep, but keeps axis (present in cur_hint).
+      batched_traj[i].data[:cur_hint[i].data.shape[0], [hint_ind]] = cur_hint[i].data
+
       if i > 0:
-        assert hint_lengths[sample_idx] == cur_length
+        assert hint_lengths[hint_ind] == cur_hint[i].data.shape[0]
       else:
-        hint_lengths[sample_idx] = cur_length
+        hint_lengths[hint_ind] = cur_hint[i].data.shape[0]
+
   return batched_traj, hint_lengths
 
 
@@ -681,3 +796,59 @@ def _subsample_data(
     sampled_traj.append(
         probing.DataPoint(dp.name, dp.location, dp.type_, sampled_data))
   return sampled_traj
+
+
+def _get_d_regular_param(nb_nodes, clrs_config, split, directed, k_16_nodes):
+  assert nb_nodes == clrs_config[split]['length'], "Number of nodes must match  split length"
+  strategy = clrs_config['strategy']
+  frac = k_16_nodes / 16
+  if strategy == 'reg_same_deg':
+    d = k_16_nodes
+  elif strategy == 'reg_same_nodes':
+    assert len(set(clrs_config[s]['length'] for s in ['train', 'test', 'val'])) == 1
+    coef = (16 / clrs_config['train']['length']) if split in ['train', 'val'] else 1.0
+    d = int(coef * clrs_config['train']['length'] * frac)
+  elif strategy == 'reg':
+    d = int(clrs_config[split]['length'] * frac)
+  else:
+    raise NotImplementedError
+  if directed:  # d incoming, d outgoing
+    d = 2 * d
+  return d
+
+
+def _get_num_communities(nb_nodes, clrs_config, split, k_16_nodes):
+  assert nb_nodes == clrs_config[split]['length'], "Number of nodes must match  split length"
+  strategy = clrs_config['strategy']
+  if strategy == 'reg_same_deg':
+    return int(k_16_nodes * clrs_config[split]['length'] / 16)
+  elif strategy == 'reg_same_nodes':
+    assert len(set(clrs_config[s]['length'] for s in ['train', 'test', 'val'])) == 1
+    if split == 'test':
+      return k_16_nodes
+    else:
+      return int(k_16_nodes * clrs_config[split]['length'] / 16)
+  elif strategy == 'reg':
+    return k_16_nodes
+  else:
+    raise NotImplementedError
+
+def _orient_edges(g: np.ndarray, rng: np.random.RandomState):
+    n = g.shape[0]
+    mask_lower = np.triu(rng.binomial(n=1, p=0.5, size=(n, n)), k=1).T
+    mask_upper = np.triu(1 - mask_lower.T, k=1)
+    mask = (mask_upper + mask_lower).astype(int)
+    g = g * mask
+    d = g.sum() // n
+    assert g.sum() == n * d
+    assert d % 2 == 0, "D Must be even!"
+    while g.sum(axis=0).max() != d:
+        v = rng.choice(np.where(g.sum(axis=1) > d)[0])
+        v_mask = g[v]
+        u = rng.choice(np.where(v_mask)[0])
+        g[v, u] = 0
+        g[u, v] = 1
+    np.testing.assert_array_equal(g.sum(axis=0), d)
+    np.testing.assert_array_equal(g.sum(axis=0), d)
+    return g
+

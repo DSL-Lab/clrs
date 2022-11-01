@@ -13,10 +13,12 @@
 # limitations under the License.
 # ==============================================================================
 """CLRS dataset."""
-
+import copy
 import dataclasses
 
 import functools
+import logging
+import os.path
 from typing import Iterator
 
 from clrs._src import probing
@@ -27,6 +29,8 @@ import jax
 import numpy as np
 import tensorflow as tf
 import tensorflow_datasets as tfds
+
+tfds.core.utils.gcs_utils._is_gcs_disabled = True
 
 
 def _correct_axis_filtering(tensor, index, name):
@@ -85,6 +89,8 @@ class CLRSDataset(tfds.core.GeneratorBasedBuilder):
         seed=samplers.CLRS30[self._builder_config.split]['seed'],
         num_samples=num_samples,
         length=samplers.CLRS30[self._builder_config.split]['length'],
+        clrs_config=samplers.CLRS30,
+        split=self._builder_config.split,
     )
     sampled_dataset = sampler.next(batch_size=1 if single_sample else None)
     data = {'input_' + t.name: t.data for t in sampled_dataset.features.inputs}
@@ -92,11 +98,20 @@ class CLRSDataset(tfds.core.GeneratorBasedBuilder):
     # guarantee that this key is unused.
     data['lengths'] = sampled_dataset.features.lengths
     data.update({'output_' + t.name: t.data for t in sampled_dataset.outputs})
-    data.update({
-        'hint_' + t.name: t.data for t in sampled_dataset.features.hints})
+    if not sampler._clrs_config['disable_hints']:
+      data.update({
+          'hint_' + t.name: t.data for t in sampled_dataset.features.hints})
     self._instantiated_dataset = data
 
   def _info(self) -> tfds.core.DatasetInfo:
+    if os.path.isfile(os.path.join(self.data_path, 'features.json')):
+      return tfds.core.DatasetInfo(
+        builder=self,
+        features=tfds.features.FeatureConnector.from_config(self.data_path)
+      )
+    else:
+      assert os.environ.get('CLRS_MAKE_DATASET', False) is not False
+
     if (self._instantiated_dataset_name != self._builder_config.name
         or self._instantiated_dataset_split != self._builder_config.split):
       self._create_data(single_sample=True)
@@ -141,24 +156,89 @@ def get_clrs_folder():
   return f'CLRS30_v{CLRSDataset.VERSION}'
 
 
-def _preprocess(data_point, algorithm=None):
+def _preprocess(data_point, max_recurrent_steps, add_random_features, algorithm, seed, batch_size, exp_flags, split):
   """Convert sampled inputs into DataPoints."""
   inputs = []
   outputs = []
   hints = []
   lengths = None
 
+  if add_random_features:
+    n_nodes = data_point['input_pos'].shape[1]
+    name = 'random_features'
+    d_features = 16
+    data = tf.random.stateless_uniform((batch_size, n_nodes, d_features), minval=-1.0, maxval=1.0, seed=seed)
+    if exp_flags.orthonormal_gaussian_features: # Take orthonormal random features using QR decomposition of gaussian
+      gaussian = tf.random.stateless_normal((batch_size, n_nodes, n_nodes), seed=seed)
+      q, r = tf.linalg.qr(gaussian)
+      data = q[:, :, :d_features]
+    dp = probing.DataPoint(name, specs.Location.NODE, specs.Type.CATEGORICAL, data)
+    inputs.append(dp)
+  if exp_flags.add_hint_mask:
+    name = 'hnt_mask'
+    data = _get_hint_mask(algorithm, data_point, hint_list=exp_flags.hint_mask_list, batch_size=batch_size)
+    data = tf.experimental.numpy.swapaxes(data, 0, 1)
+    dp = probing.DataPoint(name, specs.Location.NODE, specs.Type.MASK, data)
+    hints.append(dp)
+
   for name, data in data_point.items():
     if name == 'lengths':
+      if max_recurrent_steps > 0: # Fixed number of steps
+        data = tf.ones((batch_size, ), dtype=tf.int32) * max_recurrent_steps
+        if exp_flags.stoch_depth and split == 'train':
+          random_steps = tf.random.stateless_uniform(
+            shape=(batch_size, ), seed=seed+1, minval=max_recurrent_steps//2, maxval=max_recurrent_steps+1, dtype=tf.int32
+          )
+          data = random_steps
       lengths = data
       continue
     data_point_name = name.split('_')
     name = '_'.join(data_point_name[1:])
+    if name not in specs.SPECS[algorithm].keys():
+      logging.warning(f"{name} not in algorithm spec, ignoring ...")
+      continue
     (stage, location, dp_type) = specs.SPECS[algorithm][name]
     assert stage == data_point_name[0]
     if stage == specs.Stage.HINT:
       data = tf.experimental.numpy.swapaxes(data, 0, 1)
     dp = probing.DataPoint(name, location, dp_type, data)
+
+    if exp_flags.edgewise_pos and name == 'pos':  # Modify to edge-wise
+      assert (stage, location, dp_type) == (specs.Stage.INPUT, specs.Location.NODE, specs.Type.SCALAR)
+      n_nodes = data.shape[1]
+      pairwise_pos = tf.tile(tf.experimental.numpy.expand_dims(data, axis=-1), (1, 1, n_nodes))
+      data = tf.cast((pairwise_pos > tf.experimental.numpy.swapaxes(pairwise_pos, 1, 2)), dtype=tf.float32)
+      dp = probing.DataPoint(name, specs.Location.EDGE, specs.Type.SCALAR, data)
+    if exp_flags.random_pos and name == 'pos': # For training, randomly sample, for testing, equi-spaced
+      assert (stage, location, dp_type) == (specs.Stage.INPUT, specs.Location.NODE, specs.Type.SCALAR)
+      n_nodes = data.shape[1]
+      if split == 'train':
+        random_pos = tf.random.stateless_uniform(
+          shape=(batch_size, n_nodes), seed=seed+2, minval=0.0, maxval=1.0, dtype=data.dtype
+        )
+        random_pos_sorted = tf.sort(random_pos, axis=-1)
+        pos_sorted_idx = tf.argsort(data, axis=-1)
+        scatter_pos = tf.concat(
+          [tf.tile(tf.range(0, batch_size)[:, None, None], (1, n_nodes, 1)), pos_sorted_idx[..., None]], axis=-1
+        )
+        data_random = tf.scatter_nd(scatter_pos, random_pos_sorted, shape=(batch_size, n_nodes))
+        replace_mask = tf.tile(tf.random.stateless_binomial(
+          shape=(batch_size, 1), seed=seed+3, counts=1, probs=0.5, output_dtype=tf.float64
+        ), (1, n_nodes))
+        data = data * replace_mask + data_random * (1 - replace_mask)
+      dp = probing.DataPoint(name, location, dp_type, data)
+    if exp_flags.trans_pos_enc and name == 'pos':
+      n_nodes = data.shape[1]
+      data = _get_transformer_positional_encoding(batch_size, n_nodes, d_model=16)
+      dp = probing.DataPoint(name, location, specs.Type.CATEGORICAL, data)
+    if exp_flags.pointer_hint_categorical:
+      if specs.ORIGINAL_SPECS[algorithm][name] == (specs.Stage.HINT, specs.Location.NODE, specs.Type.POINTER):
+        n_nodes = data_point['input_pos'].shape[1]
+        data_one_hot = tf.one_hot(tf.cast(data, tf.int32), depth=n_nodes, dtype=tf.int32)
+        data_cat = data_one_hot + 2 * tf.transpose(data_one_hot, (0, 1, 3, 2))
+        data = tf.one_hot(data_cat, 4) # 0: no pointer, 1: one to the other, 2: other to the one, 3: both to each other
+        dp = probing.DataPoint(name, specs.Location.EDGE, specs.Type.CATEGORICAL, data)
+
     if stage == specs.Stage.INPUT:
       inputs.append(dp)
     elif stage == specs.Stage.OUTPUT:
@@ -169,15 +249,31 @@ def _preprocess(data_point, algorithm=None):
       samplers.Features(tuple(inputs), tuple(hints), lengths), tuple(outputs))
 
 
-def create_dataset(folder, algorithm, split, batch_size):
+def create_dataset(folder, algorithm, split, batch_size, max_recurrent_steps, add_random_features, seed, exp_flags):
   dataset = tfds.load(f'clrs_dataset/{algorithm}_{split}',
                       data_dir=folder, split=split)
   num_samples = len(dataset)  # Must be done here for correct size
+  seeds = tf.data.Dataset.random(seed=seed).batch(2)
   dataset = dataset.repeat()
   dataset = dataset.batch(batch_size)
-  return (dataset.map(lambda d: _preprocess(d, algorithm=algorithm)),
-          num_samples,
-          specs.SPECS[algorithm])
+  zip_dataset = tf.data.Dataset.zip((dataset, seeds))
+  algorithm_spec = copy.deepcopy(specs.SPECS[algorithm])
+  if add_random_features:
+    algorithm_spec['random_features'] = (specs.Stage.INPUT, specs.Location.NODE, specs.Type.CATEGORICAL)
+  if exp_flags.add_hint_mask:
+    algorithm_spec['hnt_mask'] = (specs.Stage.HINT, specs.Location.NODE, specs.Type.MASK)
+  if exp_flags.pointer_hint_categorical:
+    for key in algorithm_spec.keys():
+      if algorithm_spec[key] == (specs.Stage.HINT, specs.Location.NODE, specs.Type.POINTER):
+         algorithm_spec[key] = (specs.Stage.HINT, specs.Location.EDGE, specs.Type.CATEGORICAL)
+  return (
+    zip_dataset.map(lambda d, s: _preprocess(
+      d, algorithm=algorithm, max_recurrent_steps=max_recurrent_steps, add_random_features=add_random_features,
+      seed=s, batch_size=batch_size, exp_flags=exp_flags, split=split
+    )),
+    num_samples,
+    algorithm_spec
+  )
 
 
 def _copy_hint(source, dest, i, start_source, start_dest, to_add):
@@ -318,3 +414,79 @@ def create_chunked_dataset(folder, algorithm, split, batch_size, chunk_length):
   dataset = dataset.map(lambda d: _preprocess(d, algorithm=algorithm))
   dataset = dataset.as_numpy_iterator()
   return chunkify(dataset, chunk_length), specs.SPECS[algorithm]
+
+
+def _get_hint_mask(algorithm, data_point, hint_list, batch_size):
+  if hint_list == 'all':
+    hint_list = None
+  else:
+    hint_list = hint_list.split('/')
+
+  n_nodes = data_point['input_pos'].shape[1]
+  mask = None
+  for name, data in data_point.items():
+    if name == 'lengths':
+      continue
+    data_point_name = name.split('_')
+    name = '_'.join(data_point_name[1:])
+    stage = data_point_name[0]
+    if stage != specs.Stage.HINT:
+      continue
+    if (hint_list is None) or (name in hint_list):
+      if mask is None:
+        mask = tf.Variable(lambda : tf.zeros((batch_size, data.shape[1], n_nodes), dtype=tf.bool), name='mask')
+        mask[:, 0, :].assign(tf.ones((batch_size, n_nodes), dtype=tf.bool))
+
+      data_change = (tf.math.abs((data[:, 1:, ...] - data[:, :-1, ...])) > 0.00001)
+      (stage, location, dp_type) = specs.ORIGINAL_SPECS[algorithm][name]
+      if location == specs.Location.NODE:
+        if dp_type in [specs.Type.MASK, specs.Type.MASK_ONE, specs.Type.SCALAR]:
+          pass
+        elif dp_type == specs.Type.POINTER:
+          data_one_hot = tf.one_hot(tf.cast(data, tf.int32), depth=n_nodes)
+          data_change = (tf.math.abs((data_one_hot[:, 1:, ...] - data_one_hot[:, :-1, ...])) > 0.00001)
+          data_change = tf.math.logical_or(
+            tf.math.reduce_any(data_change, -1),
+            tf.math.reduce_any(tf.transpose(data_change, (0, 1, 3, 2)), -1)
+          )
+        elif dp_type == specs.Type.CATEGORICAL:
+          data_change = tf.reduce_any(data_change, -1)
+        else:
+          raise Exception("Nah!")
+      elif location == specs.Location.EDGE:
+        if dp_type in [specs.Type.MASK, specs.Type.MASK_ONE, specs.Type.SCALAR]:
+          data_change = tf.math.logical_or(
+            tf.math.reduce_any(data_change, -1),
+            tf.math.reduce_any(tf.transpose(data_change, (0, 1, 3, 2)), -1)
+          )
+        else:
+          raise Exception("Nah!!")
+      elif location == specs.Location.GRAPH:
+        raise Exception("No graph hints please!")
+      assert tuple(data_change.shape[1:]) == (mask.shape[1] - 1, n_nodes, ), (data_change.shape, mask.shape, name)
+      mask[:, 1:, ...].assign(tf.math.logical_or(mask[:, 1:, ...], data_change))
+
+  assert mask is not None
+  # return tf.ones((batch_size, mask.shape[1], n_nodes), dtype=tf.bool)
+  mask = _time_convolve_mask(mask)
+  return mask
+
+def _time_convolve_mask(mask):
+  conv_mask = tf.Variable(lambda: tf.zeros_like(mask), name='mask_conv')
+  conv_mask.assign(mask)
+  conv_mask[:, 1:, ...].assign(tf.math.logical_or(mask[:, :-1, ...], conv_mask[:, 1:, ...]))
+  conv_mask[:, :-1, ...].assign(tf.math.logical_or(mask[:, 1:, ...], conv_mask[:, :-1, ...]))
+  return conv_mask
+
+def get_angles(pos, i, d_model):
+  angle_rates = 1 / np.power(10000, (2 * (i // 2)) / np.float32(d_model))
+  return pos * angle_rates
+
+def _get_transformer_positional_encoding(batch_size, position, d_model):
+  angle_rads = get_angles(np.arange(position)[:, np.newaxis],
+                          np.arange(d_model)[np.newaxis, :],
+                          d_model)
+  angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2])
+  angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])
+  pos_encoding = np.tile(angle_rads[np.newaxis, ...], (batch_size, 1, 1))
+  return tf.cast(pos_encoding, dtype=tf.float32)

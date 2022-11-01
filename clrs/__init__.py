@@ -16,6 +16,7 @@
 """The CLRS Algorithmic Reasoning Benchmark."""
 
 from clrs import models
+from clrs._src import scratch
 from clrs._src import algorithms
 from clrs._src import decoders
 from clrs._src import processors
@@ -35,6 +36,7 @@ from clrs._src.samplers import Features
 from clrs._src.samplers import Feedback
 from clrs._src.samplers import Sampler
 from clrs._src.samplers import Trajectory
+from clrs._src.specs import CLRS_30_ALGS
 from clrs._src.specs import Location
 from clrs._src.specs import OutputClass
 from clrs._src.specs import Spec
@@ -65,4 +67,5 @@ __all__ = (
     "Stage",
     "Trajectory",
     "Type",
+    "scratch",
 )

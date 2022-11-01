@@ -59,7 +59,7 @@ def evaluate_hints(
   for truth in hints:
     assert truth.name in hint_preds[0]
     eval_along_time = [_evaluate(truth, p[truth.name], hints,
-                                 idx=i+1, lengths=lengths)
+                                 idx=i+1, lengths=lengths)[0]
                        for (i, p) in enumerate(hint_preds)]
     evals[truth.name] = np.sum(
         [x * np.sum(i+1 < lengths)
@@ -78,12 +78,19 @@ def evaluate(
 ) -> Dict[str, float]:
   """Evaluate output predictions."""
   evals = {}
+  node_level_metrics = {}
+  graph_level_metrics = {}
   for truth in outputs:
     assert truth.name in predictions
     pred = predictions[truth.name]
-    evals[truth.name] = _evaluate(truth, pred, outputs)
-  # Return a single scalar score that is the mean of all output scores.
-  evals['score'] = sum([v.item() for v in evals.values()]) / len(evals)
+    node_level, graph_level = _evaluate(truth, pred, outputs)
+    node_level_metrics[truth.name] = node_level
+    graph_level_metrics[truth.name + '_glevel'] = graph_level
+    # Return a single scalar score that is the mean of all output scores.
+  evals['score'] = sum([v.item() for v in node_level_metrics.values()]) / len(node_level_metrics)
+  evals['graph_score'] = sum([v.item() for v in graph_level_metrics.values()]) / len(graph_level_metrics)
+  evals.update(node_level_metrics)
+  evals.update(graph_level_metrics)
   return evals
 
 
@@ -107,7 +114,9 @@ def _evaluate(truth, pred, full_truth, idx=None, lengths=None):
         return 0.
       truth_data = truth_data[idx][idx < lengths]
       pred_data = pred_data[idx < lengths]
-    return _EVAL_FN[truth.type_](pred_data, truth_data)
+    return (
+      _EVAL_FN[truth.type_](pred_data, truth_data), graph_level_eval(truth_data.shape, truth.type_)(pred_data, truth_data)
+    )
 
 
 def _eval_one(pred, truth):
@@ -153,3 +162,38 @@ _EVAL_FN = {
     specs.Type.POINTER:
         lambda pred, truth: np.mean((pred == truth) * 1.0)
 }
+
+def graph_level_eval(truth_shape, out_type: specs.Type):
+  def _eval_one_graph(pred, truth):
+    mask = np.all(truth != specs.OutputClass.MASKED, axis=-1)
+    final_pred = np.argmax(pred, -1)
+    final_truth = np.argmax(truth, -1)
+    correct = np.logical_or(np.invert(mask), final_truth == final_pred)
+    return np.mean(np.all(correct, axis=tuple(range(1, len(correct.shape)))) * 1.0)
+
+  def _mask_fn_graph(pred, truth): # All masks within the same graph must be correct.
+    mask = (truth != specs.OutputClass.MASKED)
+    correct = np.logical_or(np.invert(mask), truth == pred)
+    return np.mean(np.all(correct, axis=tuple(range(1, len(correct.shape)))) * 1.0)
+
+  if len(truth_shape) < 2:
+    return _EVAL_FN[out_type]
+
+  eval_fn = {
+    specs.Type.SCALAR: _EVAL_FN[specs.Type.SCALAR],
+    specs.Type.MASK: _mask_fn_graph,
+    specs.Type.POINTER:
+      lambda pred, truth: np.mean(np.all(pred == truth, axis=tuple(range(1, len(truth_shape)))) * 1.0),
+  }
+  if len(truth_shape) == 2:
+    eval_fn.update({
+      specs.Type.MASK_ONE: _EVAL_FN[specs.Type.CATEGORICAL],
+      specs.Type.CATEGORICAL: _EVAL_FN[specs.Type.CATEGORICAL],
+    })
+  else:
+    eval_fn.update({
+      specs.Type.MASK_ONE: _eval_one_graph,
+      specs.Type.CATEGORICAL: _eval_one_graph,
+    })
+  return eval_fn[out_type]
+

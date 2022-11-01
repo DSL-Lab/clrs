@@ -35,11 +35,18 @@ def _get_version():
 def _parse_requirements(path):
 
   with open(os.path.join(_CURRENT_DIR, path)) as f:
-    return [
-        line.rstrip()
-        for line in f
-        if not (line.isspace() or line.startswith('#'))
-    ]
+    packages = []
+    for line in f:
+      line = line.strip()
+      # let's also ignore empty lines and comments
+      if not line or line.startswith('#'):
+        continue
+      if 'https://' in line:
+        tail = line.rsplit('/', 1)[1]
+        tail = tail.split('#')[0]
+        line = tail.replace('@', '==').replace('.git', '')
+      packages.append(line)
+  return packages
 
 
 setup(

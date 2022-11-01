@@ -16,14 +16,16 @@
 """JAX implementation of baseline processor networks."""
 
 import abc
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import chex
 import haiku as hk
 import jax
 import jax.numpy as jnp
 import numpy as np
+from ml_collections import ConfigDict
 
+from clrs._src.third_party.haiku_transformer import Transformer
 
 _Array = chex.Array
 _Fn = Callable[..., Any]
@@ -42,7 +44,7 @@ class Processor(hk.Module):
       adj_mat: _Array,
       hidden: _Array,
       **kwargs,
-  ) -> _Array:
+  ) -> Tuple[_Array, _Array, dict]:
     """Processor inference step.
 
     Args:
@@ -300,7 +302,7 @@ class PGN(Processor):
       mid_size: Optional[int] = None,
       mid_act: Optional[_Fn] = None,
       activation: Optional[_Fn] = jax.nn.relu,
-      reduction: _Fn = jnp.max,
+      reduction: Union[_Fn, str] = 'max',
       msgs_mlp_sizes: Optional[List[int]] = None,
       use_ln: bool = False,
       name: str = 'mpnn_aggr',
@@ -324,6 +326,8 @@ class PGN(Processor):
       graph_fts: _Array,
       adj_mat: _Array,
       hidden: _Array,
+      edge_hidden: _Array,
+      is_training: bool,
       **unused_kwargs,
   ) -> _Array:
     """MPNN inference step."""
@@ -332,6 +336,100 @@ class PGN(Processor):
     assert edge_fts.shape[:-1] == (b, n, n)
     assert graph_fts.shape[:-1] == (b,)
     assert adj_mat.shape == (b, n, n)
+
+    z = jnp.concatenate([node_fts, hidden], axis=-1)
+    m_1 = hk.Linear(self.mid_size)
+    m_2 = hk.Linear(self.mid_size)
+    m_e = hk.Linear(self.mid_size)
+    m_g = hk.Linear(self.mid_size)
+
+    o1 = hk.Linear(self.out_size)
+    o2 = hk.Linear(self.out_size)
+    msg_1 = m_1(z)
+    msg_2 = m_2(z)
+    msg_e = m_e(edge_fts)
+    msg_g = m_g(graph_fts)
+
+    msgs = (
+        jnp.expand_dims(msg_1, axis=1) + jnp.expand_dims(msg_2, axis=2) +
+        msg_e + jnp.expand_dims(msg_g, axis=(1, 2)))
+    if self._msgs_mlp_sizes is not None:
+      msgs = hk.nets.MLP(self._msgs_mlp_sizes)(jax.nn.relu(msgs))
+
+    if self.mid_act is not None:
+      msgs = self.mid_act(msgs)
+
+    if self.reduction in [jnp.mean, 'mean']:
+      msgs = jnp.sum(msgs * jnp.expand_dims(adj_mat, -1), axis=1)
+      msgs = msgs / jnp.sum(adj_mat, axis=-1, keepdims=True)
+    elif self.reduction in [jnp.max, 'max']:
+      maxarg = jnp.where(jnp.expand_dims(adj_mat, -1),
+                         msgs,
+                         -BIG_NUMBER)
+      msgs = jnp.max(maxarg, axis=1)
+    else:
+      msgs = self.reduction(msgs * jnp.expand_dims(adj_mat, -1), axis=1)
+
+    h_1 = o1(z)
+    h_2 = o2(msgs)
+
+    ret = h_1 + h_2
+
+    if self.activation is not None:
+      ret = self.activation(ret)
+
+    if self.use_ln:
+      ln = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
+      ret = ln(ret)
+
+    new_node_hidden = ret
+    new_edge_hidden = edge_hidden
+    return new_node_hidden, new_edge_hidden, {}
+
+
+class MyNet(Processor):
+  def __init__(
+      self,
+      out_size: int,
+      mid_size: Optional[int] = None,
+      mid_act: Optional[_Fn] = None,
+      activation: Optional[_Fn] = jax.nn.relu,
+      reduction: _Fn = jnp.max,
+      msgs_mlp_sizes: Optional[List[int]] = None,
+      use_ln: bool = False,
+      name: str = 'my_net',
+      has_graph: bool = False,
+  ):
+    super().__init__(name=name)
+    if mid_size is None:
+      self.mid_size = out_size
+    else:
+      self.mid_size = mid_size
+    self.out_size = out_size
+    self.mid_act = mid_act
+    self.activation = activation
+    self.reduction = reduction
+    self._msgs_mlp_sizes = msgs_mlp_sizes
+    self.use_ln = use_ln
+    self.has_graph = has_graph
+
+  def __call__(
+      self,
+      node_fts: _Array,
+      edge_fts: _Array,
+      graph_fts: _Array,
+      adj_mat: _Array,
+      hidden: _Array,
+      **unused_kwargs,
+  ) -> _Array:
+
+    b, n, _ = node_fts.shape
+    assert edge_fts.shape[:-1] == (b, n, n)
+    assert graph_fts.shape[:-1] == (b,)
+    assert adj_mat.shape == (b, n, n)
+
+    if not self.has_graph:  # Fully connected graph if no underlying graph
+      adj_mat = jnp.ones_like(adj_mat)
 
     z = jnp.concatenate([node_fts, hidden], axis=-1)
     m_1 = hk.Linear(self.mid_size)
@@ -357,23 +455,18 @@ class PGN(Processor):
       msgs = self.mid_act(msgs)
 
     if self.reduction == jnp.mean:
-      msgs = jnp.sum(msgs * jnp.expand_dims(adj_mat, -1), axis=1)
+      msgs = jnp.sum(msgs * jnp.expand_dims(adj_mat, -1), axis=-1)
       msgs = msgs / jnp.sum(adj_mat, axis=-1, keepdims=True)
-    elif self.reduction == jnp.max:
-      maxarg = jnp.where(jnp.expand_dims(adj_mat, -1),
-                         msgs,
-                         -BIG_NUMBER)
-      msgs = jnp.max(maxarg, axis=1)
     else:
       msgs = self.reduction(msgs * jnp.expand_dims(adj_mat, -1), axis=1)
 
-    h_1 = o1(z)
+    h_1 = ((2*64) ** 0.25) * hidden
     h_2 = o2(msgs)
 
     ret = h_1 + h_2
 
-    if self.activation is not None:
-      ret = self.activation(ret)
+    # if self.activation is not None:
+    #   ret = self.activation(ret)
 
     if self.use_ln:
       ln = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
@@ -397,9 +490,9 @@ class MPNN(PGN):
   """Message-Passing Neural Network (Gilmer et al., ICML 2017)."""
 
   def __call__(self, node_fts: _Array, edge_fts: _Array, graph_fts: _Array,
-               adj_mat: _Array, hidden: _Array, **unused_kwargs) -> _Array:
+               adj_mat: _Array, hidden: _Array, **kwargs) -> _Array:
     adj_mat = jnp.ones_like(adj_mat)
-    return super().__call__(node_fts, edge_fts, graph_fts, adj_mat, hidden)
+    return super().__call__(node_fts, edge_fts, graph_fts, adj_mat, hidden, **kwargs)
 
 
 class PGNMask(PGN):
@@ -610,12 +703,328 @@ class MemNetFull(MemNetMasked):
     return super().__call__(node_fts, edge_fts, graph_fts, adj_mat, hidden)
 
 
+class PGNMPNN(PGN):
+  def __init__(
+      self,
+      has_gaph: bool,
+      *args, **kwargs
+  ):
+    super(PGNMPNN, self).__init__(*args, **kwargs)
+    self.has_graph = has_gaph
+
+  def __call__(self, node_fts: _Array, edge_fts: _Array, graph_fts: _Array,
+               adj_mat: _Array, hidden: _Array, **kwargs) -> _Array:
+    if not self.has_graph:  # Fully connected graph if no underlying graph
+      adj_mat = jnp.ones_like(adj_mat)
+    return super().__call__(node_fts, edge_fts, graph_fts, adj_mat, hidden, **kwargs)
+
+
+class EdgeAttProcessor(Processor):
+  def __init__(
+      self,
+      out_size: int,
+      mid_size: Optional[int] = None,
+      has_graph: Optional[bool] = True,
+      apply_mask: Optional[bool] = False,
+      exp_flags: Optional[ConfigDict] = None,
+      name: str = 'edge_att',
+  ):
+    super().__init__(name=name)
+    if mid_size is None:
+      self.mid_size = out_size
+    else:
+      self.mid_size = mid_size
+    self.out_size = out_size
+    self.apply_mask = apply_mask
+    self.has_graph = has_graph
+    self.exp_flags = exp_flags
+
+  def __call__(
+      self,
+      node_fts: _Array,
+      edge_fts: _Array,
+      graph_fts: _Array,
+      adj_mat: _Array,
+      hidden: _Array,
+      edge_hidden: _Array,
+      is_training: bool,
+      **unused_kwargs,
+  ) -> Tuple[_Array, _Array, dict]:
+    """Inference step."""
+
+    b, n, _ = node_fts.shape
+    assert edge_fts.shape[:-1] == (b, n, n)
+    assert graph_fts.shape[:-1] == (b,)
+    assert adj_mat.shape == (b, n, n)
+    assert edge_hidden.shape[:-1] == (b, n, n)
+
+    if not self.has_graph:  # Fully connected graph if no underlying graph
+      adj_mat = jnp.ones_like(adj_mat)
+
+    transformer = Transformer(
+      num_heads=2, num_layers=1, dropout_rate=0.0, add_ln=self.exp_flags.add_ln_transformer,
+      name='processor_transformer',
+    )
+    lin_z = hk.Linear(self.mid_size)
+
+    graph_fts_expand_edge = jnp.tile(graph_fts[:, None, None, :], (1, n, n, 1))
+    node_fts_pairwise = _pairwise_concat(node_fts)
+    z_edge = jnp.concatenate([node_fts_pairwise, graph_fts_expand_edge, edge_fts, edge_hidden], axis=-1)
+    z_edge_flat = z_edge.reshape((b, n*n, -1))
+    mask = None
+
+    z = z_edge_flat
+    if self.apply_mask:
+      mask = self.get_edgewise_mask(adj_mat)
+
+    z_projected = lin_z(z)
+    z_transformer = transformer(z_projected, mask=mask, is_training=is_training)
+
+    new_edge_hidden = z_transformer.reshape((b, n, n, -1))
+    new_node_hidden = jnp.transpose(jnp.diagonal(new_edge_hidden, axis1=1, axis2=2), (0, 2, 1))
+
+    return new_node_hidden, new_edge_hidden, {}
+
+  @hk.transparent
+  def get_edgewise_mask(self, adj_mat):
+    b, n, _ = adj_mat.shape
+    eye_n = jnp.eye(n)
+    adj_edges = ((
+                     eye_n[:, None, :, None] + eye_n[None, :, :, None] +
+                     eye_n[:, None, None, :] + eye_n[None, :, None, :]
+                 ) > 0.5).astype(float)[None, ...]  # static matrix of connected edges through edges
+    present_edges = jnp.einsum('bij,bkl->bijkl', adj_mat, adj_mat)  # which edges are actually present?
+    mask = (adj_edges * present_edges).reshape((b, n * n, n * n))
+    return mask
+
+
+class GATEdge(Processor):
+  def __init__(
+      self,
+      has_graph: bool,
+      out_size: int,
+      nb_heads: int,
+      activation: Optional[_Fn] = jax.nn.relu,
+      residual: bool = True,
+      use_ln: bool = False,
+      name: str = 'gat_edge',
+  ):
+    super().__init__(name=name)
+    self.has_graph = has_graph
+    self.out_size = out_size
+    self.nb_heads = nb_heads
+    if out_size % nb_heads != 0:
+      raise ValueError('The number of attention heads must divide the width!')
+    self.head_size = out_size // nb_heads
+    self.activation = activation
+    self.residual = residual
+    self.use_ln = use_ln
+
+  def __call__(
+      self,
+      node_fts: _Array,
+      edge_fts: _Array,
+      graph_fts: _Array,
+      adj_mat: _Array,
+      hidden: _Array,
+      edge_hidden: _Array,
+      is_training: bool,
+      **unused_kwargs,
+  ):
+    """GAT inference step."""
+
+    b, n, _ = node_fts.shape
+    assert edge_fts.shape[:-1] == (b, n, n)
+    assert graph_fts.shape[:-1] == (b,)
+    assert adj_mat.shape == (b, n, n)
+
+    if not self.has_graph:  # Fully connected graph if no underlying graph
+      adj_mat = jnp.ones_like(adj_mat)
+
+    z = jnp.concatenate([node_fts, hidden], axis=-1)
+    m = hk.Linear(self.out_size)
+    m_e = hk.Linear(self.out_size)
+    skip = hk.Linear(self.out_size)
+
+    bias_mat = (adj_mat - 1.0) * 1e9
+    bias_mat = jnp.tile(bias_mat[..., None],
+                        (1, 1, 1, self.nb_heads))     # [B, N, N, H]
+    bias_mat = jnp.transpose(bias_mat, (0, 3, 1, 2))  # [B, H, N, N]
+
+    a_1 = hk.Linear(self.nb_heads)
+    a_2 = hk.Linear(self.nb_heads)
+    a_e = hk.Linear(self.nb_heads)
+    a_g = hk.Linear(self.nb_heads)
+
+    values = m(z)                                      # [B, N, H*F]
+    values = jnp.reshape(
+        values,
+        values.shape[:-1] + (self.nb_heads, self.head_size))  # [B, N, H, F]
+    values = jnp.transpose(values, (0, 2, 1, 3))              # [B, H, N, F]
+
+    values_e = m_e(edge_fts)
+    values_e = jnp.reshape(
+        values_e,
+        values_e.shape[:-1] + (self.nb_heads, self.head_size))  # [B, N, N, H, F]
+    values_e = jnp.transpose(values_e, (0, 3, 1, 2, 4))              # [B, H, N, N, F]
+
+    att_1 = jnp.expand_dims(a_1(z), axis=-1)
+    att_2 = jnp.expand_dims(a_2(z), axis=-1)
+    att_e = a_e(edge_fts)
+    att_g = jnp.expand_dims(a_g(graph_fts), axis=-1)
+
+    logits = (
+        jnp.transpose(att_1, (0, 2, 1, 3)) +  # + [B, H, N, 1]
+        jnp.transpose(att_2, (0, 2, 3, 1)) +  # + [B, H, 1, N]
+        jnp.transpose(att_e, (0, 3, 1, 2)) +  # + [B, H, N, N]
+        jnp.expand_dims(att_g, axis=-1)       # + [B, H, 1, 1]
+    )                                         # = [B, H, N, N]
+    coefs = jax.nn.softmax(jax.nn.leaky_relu(logits) + bias_mat, axis=-1)
+    ret = jnp.sum(jnp.transpose(coefs, (0, 1, 3, 2))[..., None] * (values[..., None,:] + values_e), axis=2)
+    ret = jnp.transpose(ret, (0, 2, 1, 3))  # [B, N, H, F]
+    ret = jnp.reshape(ret, ret.shape[:-2] + (self.out_size,))  # [B, N, H*F]
+
+    if self.residual:
+      ret += skip(z)
+
+    if self.activation is not None:
+      ret = self.activation(ret)
+
+    if self.use_ln:
+      ln = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
+      ret = ln(ret)
+
+    return ret, edge_hidden, {}
+
+
+class HybridProcessor(Processor):
+  def __init__(
+      self,
+      out_size: int,
+      msgs_mlp_sizes,
+      mid_size: Optional[int] = None,
+      has_graph: Optional[bool] = True,
+      exp_flags: Optional[ConfigDict] = None,
+      use_ln: bool = False,
+      name: str = 'hybrid_proc',
+  ):
+    super().__init__(name=name)
+
+
+    self.out_size = out_size
+    self.msgs_mlp_sizes = msgs_mlp_sizes
+    self.use_ln = use_ln
+    self.mid_size = mid_size
+    self.has_graph = has_graph
+    self.exp_flags = exp_flags
+
+
+
+  def __call__(
+      self,
+      node_fts: _Array,
+      edge_fts: _Array,
+      graph_fts: _Array,
+      adj_mat: _Array,
+      hidden: _Array,
+      edge_hidden: _Array,
+      is_training: bool,
+      **kwargs,
+  ) -> Tuple[_Array, _Array, dict]:
+
+    """Inference step."""
+    b, n, _ = node_fts.shape
+
+    processor_types = self.exp_flags.hybrid_processors.split('_')
+    processors = []
+
+    assert len(processor_types) == 2, "Exactly two processors are supported"
+    for i in range(len(processor_types)):
+      if processor_types[i] == 'p':
+        processors.append(PGNMPNN(
+          has_gaph=self.has_graph,
+          out_size=self.out_size,
+          msgs_mlp_sizes=self.msgs_mlp_sizes,
+          use_ln=self.use_ln,
+          reduction=self.exp_flags.mpnn_reduction
+        ))
+      elif processor_types[i] == 'e':
+        processors.append(EdgeAttProcessor(
+          out_size=self.out_size,
+          mid_size=self.mid_size,
+          has_graph=self.has_graph,
+          apply_mask=self.exp_flags.apply_mask,
+          exp_flags=self.exp_flags,
+        ))
+      else:
+        raise NotImplementedError
+
+    binary_lin = hk.Linear(output_size=1)
+
+    node_hidden_p1, edge_hidden_p1, aux_p1 = processors[0](
+      node_fts=node_fts, edge_fts=edge_fts, graph_fts=graph_fts, adj_mat=adj_mat, hidden=hidden,
+      edge_hidden=edge_hidden, is_training=is_training, **kwargs
+    )
+    node_hidden_p2, edge_hidden_p2, aux_p2 = processors[1](
+      node_fts=node_fts, edge_fts=edge_fts, graph_fts=graph_fts, adj_mat=adj_mat, hidden=hidden,
+      edge_hidden=edge_hidden, is_training=is_training, **kwargs
+    )
+
+    balance_loss = jnp.array(0.0)
+
+    if self.exp_flags.token_route:
+      batch_axis = tuple(range(2, len(hidden.shape)))
+      batch_shape = (b, n)
+    else:
+      batch_axis = tuple(range(1, len(hidden.shape)))
+      batch_shape = (b, )
+    if self.exp_flags.hybrid_type == 'sigmoid':
+      dec = jax.nn.sigmoid(binary_lin(hidden).mean(axis=batch_axis))
+      pgn_route = dec
+      token_gt_route = 1 - dec
+    elif self.exp_flags.hybrid_type == 'avg':
+      pgn_route = jnp.ones((b, )) * 0.5
+      token_gt_route = 1 - pgn_route
+    elif self.exp_flags.hybrid_type == 'random':
+      if is_training:
+        dec = jax.random.bernoulli(hk.next_rng_key(), 0.5, shape=batch_shape)
+      else:
+        dec = jnp.ones(batch_shape) * 0.5
+      pgn_route = dec
+      token_gt_route = 1 - dec
+    elif self.exp_flags.hybrid_type == 'switch':
+      dec = jax.nn.sigmoid(binary_lin(hidden).mean(axis=batch_axis))
+      pgn_active = jax.lax.stop_gradient(dec > 0.5).astype(float)
+      pgn_route = pgn_active * dec
+      token_gt_route = (1 - pgn_active) * (1 - dec)
+      balance_loss = 0.001 * (pgn_route.sum() + token_gt_route.sum())
+    else:
+      raise NotImplementedError
+
+    output = jax.tree_util.tree_map(
+      lambda h_pgn, h_token_gt: (h_pgn * _expand_to(pgn_route, h_pgn) + h_token_gt * _expand_to(token_gt_route, h_token_gt)),
+      (node_hidden_p1, edge_hidden_p1, aux_p1),
+      (node_hidden_p2, edge_hidden_p2, aux_p2)
+    )
+
+    node_hidden, edge_hidden, aux_hybrid = output
+    aux_hybrid['balance_loss'] = balance_loss
+    aux_hybrid['mpnn_pgn_route'] = pgn_route
+    aux_hybrid['edge_att_route'] = token_gt_route
+    return output
+
+############## Process Factory
+
 ProcessorFactory = Callable[[int], Processor]
 
 
-def get_processor_factory(kind: str,
-                          use_ln: bool,
-                          nb_heads: Optional[int] = None) -> ProcessorFactory:
+def get_processor_factory(
+    kind: str,
+    use_ln: bool,
+    nb_heads: Optional[int] = None,
+    has_graph: Optional[bool] = False,
+    exp_flags: Optional[ConfigDict] = None
+) -> ProcessorFactory:
   """Returns a processor factory.
 
   Args:
@@ -638,6 +1047,13 @@ def get_processor_factory(kind: str,
           out_size=out_size,
           nb_heads=nb_heads,
           use_ln=use_ln
+      )
+    elif kind == 'gat_edge':
+      processor = GATEdge(
+        has_graph=has_graph,
+        out_size=out_size,
+        nb_heads=nb_heads,
+        use_ln=use_ln
       )
     elif kind == 'gat_full':
       processor = GATFull(
@@ -673,19 +1089,54 @@ def get_processor_factory(kind: str,
       processor = MPNN(
           out_size=out_size,
           msgs_mlp_sizes=[out_size, out_size],
-          use_ln=use_ln
+          use_ln=use_ln,
+          reduction=exp_flags.mpnn_reduction,
       )
     elif kind == 'pgn':
       processor = PGN(
           out_size=out_size,
           msgs_mlp_sizes=[out_size, out_size],
-          use_ln=use_ln
+          use_ln=use_ln,
+          reduction=exp_flags.mpnn_reduction,
+      )
+    elif kind == 'pgn_mpnn':
+      processor = PGNMPNN(
+          has_gaph=has_graph,
+          out_size=out_size,
+          msgs_mlp_sizes=[out_size, out_size],
+          use_ln=use_ln,
+          reduction=exp_flags.mpnn_reduction
       )
     elif kind == 'pgn_mask':
       processor = PGNMask(
           out_size=out_size,
           msgs_mlp_sizes=[out_size, out_size],
-          use_ln=use_ln
+          use_ln=use_ln,
+          reduction=exp_flags.mpnn_reduction
+      )
+    elif kind == 'mynet':
+      processor = MyNet(
+          out_size=out_size,
+          msgs_mlp_sizes=[out_size, out_size],
+          use_ln=use_ln,
+          has_graph=has_graph
+      )
+    elif kind == 'edge_att':
+      processor = EdgeAttProcessor(
+        out_size=out_size,
+        mid_size=out_size,
+        has_graph=has_graph,
+        apply_mask=exp_flags.apply_mask,
+        exp_flags=exp_flags,
+      )
+    elif kind == 'hybrid':
+      processor = HybridProcessor(
+        out_size=out_size,
+        mid_size=out_size,
+        has_graph=has_graph,
+        exp_flags=exp_flags,
+        msgs_mlp_sizes=[out_size, out_size],
+        use_ln=use_ln,
       )
     else:
       raise ValueError('Unexpected processor kind ' + kind)
@@ -705,3 +1156,23 @@ def _position_encoding(sentence_size: int, embedding_size: int) -> np.ndarray:
       encoding[i - 1, j - 1] = (i - (le - 1) / 2) * (j - (ls - 1) / 2)
   encoding = 1 + 4 * encoding / embedding_size / sentence_size
   return np.transpose(encoding)
+
+
+def _pairwise_concat(x: _Array):
+  b, n, d = x.shape
+  x_in = jnp.tile(jnp.expand_dims(x, axis=-2), (1, 1, n, 1))
+  x_out = jnp.transpose(x_in, (0, 2, 1, 3))
+  return jnp.concatenate([x_in, x_out], axis=-1)
+
+def _get_conv_matrix(b, n):
+  mat = jnp.diag(jnp.ones(n), k=0)
+  for i in range(1, 4):
+    mat = mat + jnp.diag(jnp.ones(n-i), k=i) + jnp.diag(jnp.ones(n-i), k=-i)
+  mat_batched = jnp.tile(mat[None, ...], (b, 1, 1))
+  return mat_batched
+
+
+def _expand_to(x: _Array, y: _Array) -> _Array:
+  while len(y.shape) > len(x.shape):
+    x = jnp.expand_dims(x, -1)
+  return x
