@@ -54,7 +54,15 @@ We also provide a simplified notebook in Google Colab, which contains data gener
 Please consider citing our paper if you use this code in your research work:
 
 ```
-@article{,
+@article{
+  mahdavi2023towards,
+  title={Towards Better Out-of-Distribution Generalization of Neural Algorithmic Reasoning Tasks},
+  author={Sadegh Mahdavi and Kevin Swersky and Thomas Kipf and Milad Hashemi and Christos Thrampoulidis and Renjie Liao},
+  journal={Transactions on Machine Learning Research},
+  issn={2835-8856},
+  year={2023},
+  url={https://openreview.net/forum?id=xkrtvHlp3P},
+  note={}
 }
 ```
 
