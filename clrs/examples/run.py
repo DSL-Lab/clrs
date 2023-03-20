@@ -100,7 +100,7 @@ flags.DEFINE_boolean('add_random_features', True,
                      'Whether to add random features to each datapoint.')
 flags.DEFINE_boolean('debug', False, 'Activate debugging.')
 flags.DEFINE_enum('discretizer', 'none', ['none', 'binary', 'vq', 'gumbel'], 'What discretizer to use?')
-flags.DEFINE_boolean('clip_grad', False, 'Clip Gradient Norm?')
+flags.DEFINE_boolean('clip_grad', True, 'Clip Gradient Norm?')
 flags.DEFINE_string('wandb_project', 'clrs_project', 'WandB project name.')
 flags.DEFINE_string('wandb_team', 'clrs_team', 'WandB team name.')
 config_flags.DEFINE_config_dict('exp_flags', ConfigDict({
